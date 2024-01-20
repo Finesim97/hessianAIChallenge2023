@@ -1,0 +1,200 @@
+---
+title: "AI Serving Grid Stability"
+subtitle: "Simple Feature Outliers, Autoencoders"
+author: "Lukas Klein"
+date: "01/20/2024"
+bibliography: references.bib
+csl: nature.csl
+format:
+  revealjs: 
+    theme: [serif, custom.scss]
+    footer: "Lukas Klein"
+    embed-resources: true
+---
+
+# Introduction
+
+```{python}
+#| echo: false
+import kaggle
+from pathlib import Path
+from zipfile import ZipFile
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+competition = "ai-serving-grid-stability"
+filedir = "./cache"
+targetfile = Path(filedir) / (competition + ".zip")
+
+kaggle.api.competition_download_files(competition, path=filedir)
+
+allfiles = {}
+with ZipFile(targetfile) as myzip:
+    toread  = myzip.namelist()
+    for fname in toread:
+        with myzip.open(fname) as f:
+            allfiles[fname] = pd.read_csv(f)
+
+for tofix in ["train.csv", "test.csv"]:
+    allfiles[tofix]["Datum_Uhrzeit_CET"] = pd.to_datetime(allfiles[tofix]["Datum_Uhrzeit_CET"])
+    allfiles[tofix].set_index(["id"], inplace=True)
+```
+
+## Crucial Information
+
+*Competition*: [see @Remppis2023]
+
+*Goal of TransnetBW and other operators*: Maintain 50 Hz, match consumption and production 
+
+*Data from*: Secondary reverse (active after max **5 min**), `aFR`
+
+**PICASSO**: Monitor and regulate secondary revcerses across countries
+
+::: {.fragment .highlight-red}
+
+**Our Goal**: Detect anamolies in the data
+
+:::
+
+## Important Patterns and Relations
+
+Limit anomaly detection to participants: `participationCMO` or `participationIN`
+
+Explanation of `correction`, `correctedDemand`, `Demand`:
+
+- `Demand`: Imbalance before activation of aFRR (automated frequency restoration reserves)
+- `correction`: Signal to correct for the exchange of aFRR
+
+---
+
+Patterns:
+
+- `correction` + `correctionEcho`: 4-8s usually
+- `correctedDemand`, `aFRRactivation` + `aFRRrequest`: Demmand, Activation and Request
+- `LFCInput` is the control variable of the restoration controller which is calculated from `FRCE`
+
+
+Behaviours may be different between the control areas!
+
+## Known Anomaly Types
+
+Currently known anomaly types: 6
+
+* Async. or large time delay `aFRRactivation`, `aFRRrequest`: Aggregated Feature (`BandLimitedCorrectedDemand`)
+* Weird behaviour between `FRCE` and `LFCInput` 
+* Not correct echo between `correction` and `correctionEcho`
+
+## Challenge Data
+
+Data from two `controlArea`s in the `train.csv`: approx. 6 months with $\Delta t = 4 s$
+
+Additionally, `test.csv` is seperated into 21 2h segments, each point within needs to be classified
+
+## Evaluation
+
+::: {.incremental}
+1. Detection Score (F-Beta with 1.75)
+2. Best Complete Package
+:::
+
+. . .
+
+$\beta = 1.75 \rightarrow$ **Minimize False Negatives!**
+
+# Exploring the Data
+
+## Time Ranges
+
+What time ranges are covered?
+
+```{python}
+#| echo: false
+allfiles["train.csv"].groupby("controlArea")["Datum_Uhrzeit_CET"].agg(["size", "min", "max"]).set_axis(["Points", "Start", "End"], axis=1)
+```
+
+
+## Time Steps
+
+What is the $\Delta t$ (across both control areas)?
+
+```{python}
+#| echo: false
+allfiles["train.csv"].groupby("controlArea")["Datum_Uhrzeit_CET"].diff().value_counts().to_frame()
+```
+
+---
+
+Where do these weird jumps occur?
+
+```{python}
+#| echo: false
+
+def selrows(df, sec=4):
+    selected = df["Datum_Uhrzeit_CET"].diff() > pd.Timedelta(seconds=sec)
+    selected = selected | selected.shift(1) | selected.shift(-1)
+    return df[selected]
+
+
+allfiles["train.csv"].groupby("controlArea").apply(selrows).loc[:,["Datum_Uhrzeit_CET"]]
+```
+
+## Weekly Mean Patterns
+
+
+```{python}
+tplt = allfiles["train.csv"].groupby(["controlArea", pd.Grouper(key='Datum_Uhrzeit_CET', freq='W-MON')]).agg(["mean"])
+tplt = tplt.reset_index()
+tplt.columns = tplt.columns.droplevel(1)
+tplt = tplt.melt(id_vars=["Datum_Uhrzeit_CET", "controlArea"]) 
+
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow1)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}")
+plt.tight_layout()
+```
+
+---
+
+```{python}
+toshow2 = {'FRCE', 'LFCInput'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow2)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}").set(ylim=(-10, 10))
+plt.tight_layout()
+```
+
+---
+
+```{python}
+toshow3 = {'correction', 'correctionEcho'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow3)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}")
+plt.tight_layout()
+```
+
+# Exploiting Expected Patterns
+
+
+
+
+
+## References
