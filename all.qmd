@@ -1,0 +1,92 @@
+---
+title: "AI Serving Grid Stability"
+author: "Lukas Klein"
+format: revealjs
+---
+
+# Introduction
+
+```{python}
+#| echo: false
+import kaggle
+from pathlib import Path
+from zipfile import ZipFile
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+competition = "ai-serving-grid-stability"
+filedir = "./cache"
+targetfile = Path(filedir) / (competition + ".zip")
+
+kaggle.api.competition_download_files(competition, path=filedir)
+
+allfiles = {}
+with ZipFile(targetfile) as myzip:
+    toread  = myzip.namelist()
+    for fname in toread:
+        with myzip.open(fname) as f:
+            allfiles[fname] = pd.read_csv(f)
+for tofix in ["train.csv", "test.csv"]:
+    allfiles[tofix]["Datum_Uhrzeit_CET"] = pd.to_datetime(allfiles[tofix]["Datum_Uhrzeit_CET"])
+    allfiles[tofix].set_index(["id"], inplace=True)
+```
+
+# Exploring the data
+
+## Crucial information
+
+*Goal of TransnetBW*: Maintain 50 Hz
+
+*Data from*: Secondary reverse (active after max **5 min**)
+
+**PICASSO**: Monitor and regulate secondary revcerses across countries
+
+::: {.fragment .highlight-red}
+
+**Our Goal**: Detect anamolies in the data
+
+:::
+
+## Evaluation
+
+::: {.incremental}
+1. Detection Score (F-Beta with 1.75)
+2. Best Complete Package
+:::
+
+---
+
+$\beta = 1.75 \rightarrow$ **Minimize False Negatives!**
+
+## Looking at the data
+
+
+```{python}
+#| echo: false
+tplt = allfiles["train.csv"].head(2000).set_index("Datum_Uhrzeit_CET").groupby("controlArea").plot()
+
+
+```
+
+
+## Time Steps
+
+```{python}
+#| echo: false
+allfiles["train.csv"].groupby("controlArea")["Datum_Uhrzeit_CET"].diff().value_counts().to_frame()
+```
+
+---
+
+```{python}
+#| echo: false
+
+def selrows(df, sec=4):
+    selected = df["Datum_Uhrzeit_CET"].diff() > pd.Timedelta(seconds=sec)
+    selected = selected | selected.shift(1) | selected.shift(-1)
+    return df[selected]
+
+
+allfiles["train.csv"].groupby("controlArea").apply(selrows)
+```
