@@ -23,12 +23,18 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import dtw
+from tqdm import tqdm
+from functools import partial
+
+np.random.seed(0)
 
 competition = "ai-serving-grid-stability"
 filedir = "./cache"
 targetfile = Path(filedir) / (competition + ".zip")
 
-kaggle.api.competition_download_files(competition, path=filedir)
+if not targetfile.exists():
+    kaggle.api.competition_download_files(competition, path=filedir)
 
 allfiles = {}
 with ZipFile(targetfile) as myzip:
@@ -140,8 +146,58 @@ def selrows(df, sec=4):
 allfiles["train.csv"].groupby("controlArea").apply(selrows).loc[:,["Datum_Uhrzeit_CET"]]
 ```
 
-## Weekly Mean Patterns
 
+## Example Hour
+
+```{python}
+randomperi = allfiles["train.csv"]["Datum_Uhrzeit_CET"].sample(1).dt.to_period("h").iloc[0]
+
+tplt = allfiles["train.csv"][(randomperi.start_time <= allfiles["train.csv"]["Datum_Uhrzeit_CET"]) & (allfiles["train.csv"]["Datum_Uhrzeit_CET"] <= randomperi.end_time)]
+tplt = tplt.melt(id_vars=["Datum_Uhrzeit_CET", "controlArea"]) 
+
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow1)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}")
+plt.tight_layout()
+```
+
+---
+
+```{python}
+toshow2 = {'FRCE', 'LFCInput'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow2)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}").set(ylim=(-10, 10))
+plt.tight_layout()
+```
+
+---
+
+```{python}
+toshow3 = {'correction', 'correctionEcho'}
+
+g = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow3)], x="Datum_Uhrzeit_CET", y="value",
+    col="controlArea", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Control Area: {col_name}")
+plt.tight_layout()
+```
+
+## Weekly Mean
 
 ```{python}
 tplt = allfiles["train.csv"].groupby(["controlArea", pd.Grouper(key='Datum_Uhrzeit_CET', freq='W-MON')]).agg(["mean"])
@@ -191,10 +247,277 @@ _ = g.set_titles("Control Area: {col_name}")
 plt.tight_layout()
 ```
 
-# Exploiting Expected Patterns
+# Feature Mining
+
+## Feautre Mining: Smoothing
+
+Exponential Smoothing with a half life of 30 seconds:
+
+```{python}
+ex = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].head(250000)
+halflife='0.5 min'
+randomperi = ex["Datum_Uhrzeit_CET"].sample(1).dt.to_period("h").iloc[0]
+
+tplt_direct = ex[(randomperi.start_time <= ex["Datum_Uhrzeit_CET"]) & (ex["Datum_Uhrzeit_CET"] <= randomperi.end_time)].copy()
+tplt_smooth = tplt_direct.copy()
+tplt_smooth["correctedDemand"] = tplt_smooth["correctedDemand"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+tplt_smooth["aFRRactivation"] = tplt_smooth["aFRRactivation"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+tplt_smooth["aFRRrequest"] = tplt_smooth["aFRRrequest"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+tplt_smooth["BandLimitedCorrectedDemand"] = tplt_smooth["BandLimitedCorrectedDemand"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+
+
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest','BandLimitedCorrectedDemand'}
+
+tplt_direct = tplt_direct.melt(id_vars=["Datum_Uhrzeit_CET"]) 
+tplt_direct = tplt_direct[tplt_direct.variable.isin(toshow1)]
+tplt_direct['Smoothed'] = 'no'
+
+tplt_smooth = tplt_smooth.melt(id_vars=["Datum_Uhrzeit_CET", "controlArea"]) 
+tplt_smooth = tplt_smooth[tplt_smooth.variable.isin(toshow1)]
+tplt_smooth['Smoothed'] = 'yes'
+
+tplt = pd.concat([tplt_direct, tplt_smooth])
+del tplt_smooth, tplt_direct
+
+
+g = sns.relplot(
+    data=tplt, x="Datum_Uhrzeit_CET", y="value",
+    col="Smoothed", hue="variable",
+    kind="line"
+)
+sns.move_legend(g, "upper right")
+_ = g.set_titles("Smoothed: {col_name}")
+plt.tight_layout()
+```
+
+## DTW Alignment Example
+
+Example from the `dtw` python package:
+
+```{python}
+#| echo: true
+idx = np.linspace(0,6.28,num=100)
+query = np.sin(idx) + np.random.uniform(size=100)/10.0
+reference = np.cos(idx)
+alignment = dtw.dtw(query,reference, keep_internals=True, open_end=True, open_begin=True,step_pattern="asymmetric")
+alignment.plot(type="twoway",offset=1)   
+```
+
+## Aligning the Time Series
+
+**Problem**: Memory requirement for large alignments
+
+**Idea**: Only look at windows
+
+From the test data format: 2 h windows
+
+Move them 1:50 h, Skip first approx 20 secs
+
+## Feature Mining: Alignment of correctionEcho to correction
+
+Settings: Asymmetric alignment, open end
+
+Calculate: Time offset and Value offset from the 'view' of the echo
+
+```{python}
+
+def analyse_direct_and_lag(df, skip=int(round(20/4)), lagging='correctionEcho', reference='correction'):
+    alignment = dtw.dtw(df[lagging], df[reference], keep_internals=False, open_end=True, open_begin=False,step_pattern="asymmetric")
+    al = pd.DataFrame({'query':alignment.index1,'ref':alignment.index2})
+    al = al.groupby("query")['ref'].max()
+    # Drop indices, otherwise subtraction aligns them
+    echovals = df.iloc[al.index].reset_index(drop=True)
+    referencevals = df.iloc[al].reset_index(drop=True)
+    res = pd.DataFrame({'id':df.iloc[al.index].index, 'time_shift_sec':(echovals["Datum_Uhrzeit_CET"]-referencevals["Datum_Uhrzeit_CET"])/pd.Timedelta(seconds=1), 'lagging':echovals[lagging], 'reference':referencevals[reference]})
+    return res.iloc[skip:,:]
+
+windowsize = int(round((120*60)/4))
+stepsize = int(round((110*60)/4))
+
+win = ex.rolling(windowsize, step=stepsize)
+window_cor_res = pd.concat([analyse_direct_and_lag(df) for df in tqdm(win, total=sum((1 for _ in win)))])
+```
+
+Example:
+
+```{python}
+window_cor_res.sample(5)
+```
+
+## Feature Mining: Alignment of Request, Demmand, Activation
+
+- FRRrequest to BandLimitedCorrectedDemand
+- aFRRactivation to FRRrequest
+
+Same settings, but ignore first minute.
+
+```{python}
+ex["BandLimitedCorrectedDemand"] = ex["BandLimitedCorrectedDemand"].ewm(halflife=halflife, times=ex["Datum_Uhrzeit_CET"]).mean()
+ex["aFRRrequest"] = ex["aFRRrequest"].ewm(halflife=halflife, times=ex["Datum_Uhrzeit_CET"]).mean()
+ex["aFRRactivation"] = ex["aFRRactivation"].ewm(halflife=halflife, times=ex["Datum_Uhrzeit_CET"]).mean()
+
+win = ex.rolling(windowsize, step=stepsize)
+window_demmand_res = pd.concat([partial(analyse_direct_and_lag, lagging='aFRRrequest', reference='BandLimitedCorrectedDemand', skip=int(round(60/4)))(df) for df in tqdm(win, total=sum((1 for _ in win)))])
+window_req_res = pd.concat([partial(analyse_direct_and_lag, lagging='aFRRactivation', reference='aFRRrequest', skip=int(round(60/4)))(df) for df in tqdm(win, total=sum((1 for _ in win)))])
+```
+
+---
+
+FRRrequest to BandLimitedCorrectedDemand:
+
+```{python}
+window_demmand_res.sample(5)
+```
+
+aFRRactivation to FRRrequest:
+
+```{python}
+window_req_res.sample(5)
+```
+
+## Feature Mining: 5min Context Window
+
+*Idea:* Calculate Features describing a small sliding window centered on the point (5 min for now):
+
+- Mean
+- SD
+
+```{python}
+winshort = ex.head(1000).loc[:, ['aFRRrequest']].rolling(int(round(5*60/4)), center=False)
+for i, window in  enumerate(winshort):
+    if i >= 100:
+        break
+
+def meanabs_change(col):
+    return col.diff().abs().mean(skipna=True)
+
+res = winshort.agg(['mean','std']).dropna(how='all')
+res.sample(5)
+```
+
+## Feature Mining
+
+- Align `correctionEcho` to `correction` (First 5 values are invalid, skipped), calculate value and time difference
+- Smooth `correctedDemand`, `aFRRactivation`, `aFRRrequest`,`BandLimitedCorrectedDemand` exponentially with $\lambda_{0.5}=30 s$
+- Align `aFRRrequest` to `BandLimitedCorrectedDemand` (First 15 values are invalid, skipped), calculate value and time difference
+- Align `aFRRactivation` to `aFRRrequest` (First 15 values are invalid, skipped), calculate value and time difference
+- Min-Max Scale (Within one time span each) the smoothed features, `LFCInput` and `FRCE`, these are now features
 
 
 
+```{python}
 
+def exp_smooth(x, halflife, datecol):
+    res = x.drop(columns=datecol).ewm(halflife=halflife, times=x[datecol]).mean()
+    res[datecol] = x[datecol]
+    return res
+
+def align(x, lagging_name, reference_name, datecol, skip):
+    alignment = dtw.dtw(x[lagging_name], x[reference_name], keep_internals=False, open_end=True, open_begin=False,    step_pattern="asymmetric")
+    # Query view:
+    al = pd.DataFrame({'query':alignment.index1,'ref':alignment.index2})
+    al = al.groupby("query")['ref'].max()
+    # Drop indices, otherwise subtraction aligns them
+    echovals = x.iloc[al.index].reset_index(drop=True)
+    referencevals = x.iloc[al].reset_index(drop=True)
+    res = pd.DataFrame({f'{lagging_name}_{reference_name}_time_shift_sec':(echovals[datecol]-referencevals[datecol])/pd.Timedelta(seconds=1), f'{lagging_name}_{reference_name}_diff':echovals[lagging_name]-referencevals[reference_name]})
+    if skip!=0:
+        res.iloc[:skip,:] = np.nan
+    return res
+
+def analyze_window(x, windowsize, min_periods):
+    window = x.rolling(windowsize, min_periods=min_periods, center=True)
+    res = window.agg(['mean','std'])
+    return res
+
+smoother = partial(exp_smooth, halflife='30 s', datecol='Datum_Uhrzeit_CET')
+aligner = partial(align, datecol='Datum_Uhrzeit_CET')
+window_analysis = partial(analyze_window, windowsize=int(round(2.5*60/4)), min_periods=2)
+
+
+def features(d, i=None):
+    cor_aligned = aligner(d, "correctionEcho", "correction", skip=5)
+    smoothed = smoother(d.loc[:,['correctedDemand','aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand', 'Datum_Uhrzeit_CET']]).reset_index(drop=True)
+    req_aligned = aligner(smoothed, "aFRRrequest", "BandLimitedCorrectedDemand", skip=15)
+    activation_aligned = aligner(smoothed, "aFRRactivation", "aFRRrequest", skip=15)
+    smoothed.drop(columns="Datum_Uhrzeit_CET", inplace=True)
+    normalized_smoothed=((smoothed-smoothed.min())/(smoothed.max()-smoothed.min())).fillna(0)
+    windowed = window_analysis(normalized_smoothed)
+    windowed = windowed.set_axis(["_".join(c) for c in windowed.columns],axis=1)
+    res = pd.concat([cor_aligned, req_aligned, activation_aligned, normalized_smoothed, windowed],axis=1)
+    if i is not None:
+        res['i'] = i
+    res['id'] = d.index
+    return res
+```
+
+```{python}
+sequencelen = int(round(2*60*60/4))
+speed = 60
+win = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].rolling(sequencelen, step=int(round(sequencelen*speed)))
+wins = sum((1 for _ in win))
+res = pd.concat([features(d,i) for i, d in tqdm(enumerate(win), total=wins)], axis=0)
+```
+
+```{python}
+sizes = res.i.value_counts()
+res = res[res.i.isin(sizes.index[sizes == sequencelen])].copy()
+```
+
+
+
+```{python}
+corr = res.drop(columns="i").select_dtypes('number').corr()
+# plot the heatmap
+sns.heatmap(corr)
+```
+
+
+
+```{python}
+corr = res.drop(columns="i").select_dtypes('number').corr()
+# plot the heatmap
+sns.heatmap(corr)
+```
 
 ## References
+
+
+```{python}
+from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import KNNImputer
+
+pipe = Pipeline([('scaler', StandardScaler()),('imputer', KNNImputer(n_neighbors=25, weights="uniform")),  ('outlier', IsolationForest(random_state=0, verbose=10, n_estimators=1000, max_samples=1024*8, max_features=1.0, bootstrap=True, n_jobs=2))], verbose=True).fit(res.drop(columns=["i", "id"]))
+```
+
+```{python}
+outliers = pd.Series(pipe.predict(res.drop(columns=["i", "id"])))
+outliers_groups = outliers.ne(outliers.shift()).cumsum()[outliers==-1]
+g = outliers_groups.rename('group').reset_index(drop=False).groupby("group").indices
+```
+
+```{python}
+toget = list(g.values())[90]
+dat = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].copy()
+
+ixbad = np.where(dat.index.isin(res["id"].iloc[toget]))
+
+start = max(np.min(ixbad) - 50,0)
+end = min(np.max(ixbad) + 50, dat.shape[0])
+tplt = dat.iloc[start:end,:]
+
+tplt = tplt.melt(id_vars=["Datum_Uhrzeit_CET", "controlArea"]) 
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand'}
+#toshow1 = {'correction', 'correctionEcho'}
+
+g1 = sns.relplot(
+    data=tplt[tplt.variable.isin(toshow1)], x="Datum_Uhrzeit_CET", y="value",
+    hue="variable",
+    kind="line"
+)
+plt.axvspan(dat["Datum_Uhrzeit_CET"].iloc[np.min(ixbad)], dat["Datum_Uhrzeit_CET"].iloc[np.max(ixbad)], alpha=0.5)
+sns.move_legend(g1, "upper right")
+plt.tight_layout()
+```
