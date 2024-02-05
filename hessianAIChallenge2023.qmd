@@ -24,8 +24,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import dtw
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from functools import partial
+from joblib import Parallel, delayed, dump, load
 
 np.random.seed(0)
 
@@ -254,7 +255,7 @@ plt.tight_layout()
 Exponential Smoothing with a half life of 30 seconds:
 
 ```{python}
-ex = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].head(250000)
+ex = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].head(25000)
 halflife='0.5 min'
 randomperi = ex["Datum_Uhrzeit_CET"].sample(1).dt.to_period("h").iloc[0]
 
@@ -264,9 +265,11 @@ tplt_smooth["correctedDemand"] = tplt_smooth["correctedDemand"].ewm(halflife=hal
 tplt_smooth["aFRRactivation"] = tplt_smooth["aFRRactivation"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
 tplt_smooth["aFRRrequest"] = tplt_smooth["aFRRrequest"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
 tplt_smooth["BandLimitedCorrectedDemand"] = tplt_smooth["BandLimitedCorrectedDemand"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+tplt_smooth["FRCE"] = tplt_smooth["FRCE"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
+tplt_smooth["LFCInput"] = tplt_smooth["LFCInput"].ewm(halflife=halflife, times=tplt_smooth["Datum_Uhrzeit_CET"]).mean()
 
 
-toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest','BandLimitedCorrectedDemand'}
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest','BandLimitedCorrectedDemand', "FRCE", "LFCInput"}
 
 tplt_direct = tplt_direct.melt(id_vars=["Datum_Uhrzeit_CET"]) 
 tplt_direct = tplt_direct[tplt_direct.variable.isin(toshow1)]
@@ -427,7 +430,7 @@ def align(x, lagging_name, reference_name, datecol, skip):
 
 def analyze_window(x, windowsize, min_periods):
     window = x.rolling(windowsize, min_periods=min_periods, center=True)
-    res = window.agg(['mean','std'])
+    res = window.agg(['mean'])
     return res
 
 smoother = partial(exp_smooth, halflife='30 s', datecol='Datum_Uhrzeit_CET')
@@ -435,16 +438,24 @@ aligner = partial(align, datecol='Datum_Uhrzeit_CET')
 window_analysis = partial(analyze_window, windowsize=int(round(2.5*60/4)), min_periods=2)
 
 
-def features(d, i=None):
+def calc_features(d, i=None):
     cor_aligned = aligner(d, "correctionEcho", "correction", skip=5)
-    smoothed = smoother(d.loc[:,['correctedDemand','aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand', 'Datum_Uhrzeit_CET']]).reset_index(drop=True)
+    
+    smoothed = smoother(d.loc[:,['correctedDemand','aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand', "LFCInput", "FRCE",'Datum_Uhrzeit_CET']]).reset_index(drop=True)
     req_aligned = aligner(smoothed, "aFRRrequest", "BandLimitedCorrectedDemand", skip=15)
+    req_aligned = aligner(smoothed, "aFRRrequest", "correctedDemand", skip=15)
     activation_aligned = aligner(smoothed, "aFRRactivation", "aFRRrequest", skip=15)
-    smoothed.drop(columns="Datum_Uhrzeit_CET", inplace=True)
-    normalized_smoothed=((smoothed-smoothed.min())/(smoothed.max()-smoothed.min())).fillna(0)
-    windowed = window_analysis(normalized_smoothed)
-    windowed = windowed.set_axis(["_".join(c) for c in windowed.columns],axis=1)
-    res = pd.concat([cor_aligned, req_aligned, activation_aligned, normalized_smoothed, windowed],axis=1)
+    control_aligned = aligner(smoothed, "LFCInput", "FRCE", skip=15)
+
+    #smoothed.drop(columns="Datum_Uhrzeit_CET", inplace=True)
+    #normalized_smoothed=((smoothed-smoothed.min())/(smoothed.max()-smoothed.min())).fillna(0)
+
+    #windowed = window_analysis(smoothed.drop(columns="Datum_Uhrzeit_CET"))
+    #windowed = windowed.set_axis(["_".join(c) for c in windowed.columns],axis=1).reset_index(drop=True)
+    #for col in smoothed.drop(columns="Datum_Uhrzeit_CET").columns:
+    #    smoothed[col] = smoothed[col].div(windowed[col + "_mean"], 1).abs().replace([np.inf, -np.inf], 1)
+
+    res = pd.concat([cor_aligned, req_aligned, activation_aligned, control_aligned],axis=1)
     if i is not None:
         res['i'] = i
     res['id'] = d.index
@@ -452,16 +463,33 @@ def features(d, i=None):
 ```
 
 ```{python}
-sequencelen = int(round(2*60*60/4))
-speed = 60
-win = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].rolling(sequencelen, step=int(round(sequencelen*speed)))
-wins = sum((1 for _ in win))
-res = pd.concat([features(d,i) for i, d in tqdm(enumerate(win), total=wins)], axis=0)
+sequencelen = int(round(4*60*60/4))
+speed = 5
+
+features = {}
+
+for i, (area, ix) in enumerate(tqdm(list(allfiles["train.csv"].groupby("controlArea").indices.items()), position=0, desc="Control Areas")):
+    areafile = Path(filedir) / (f"features_control_controlarea_{area}.pq")
+    if not areafile.exists():
+        toanalyze = allfiles["train.csv"].iloc[ix,:]
+        win = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].rolling(sequencelen, step=int(round(sequencelen*speed)))
+        wins = sum((1 for _ in win))
+        #res = pd.concat([calc_features(d,i) for i, d in tqdm(enumerate(win), total=wins, position=1+i, leave=True, desc=f"Control Area {area}")], axis=0)
+        res = pd.concat(tqdm(Parallel(n_jobs=4,return_as="generator")([delayed(calc_features)(d,i) for i, d in enumerate(win)]), total=wins, position=1+i, leave=True, desc=f"Control Area {area}"), axis=0)
+        sizes = res.i.value_counts()
+        res = res[res.i.isin(sizes.index[sizes == sequencelen])]
+        res.to_parquet(areafile)
+    features[area] = pd.read_parquet(areafile)
+
 ```
 
+
+## Feature Correlation
+
 ```{python}
-sizes = res.i.value_counts()
-res = res[res.i.isin(sizes.index[sizes == sequencelen])].copy()
+corr = features[area].drop(columns=["i","id"]).select_dtypes('number').corr()
+# plot the heatmap
+sns.clustermap(corr)
 ```
 
 
@@ -472,44 +500,77 @@ corr = res.drop(columns="i").select_dtypes('number').corr()
 sns.heatmap(corr)
 ```
 
-
-
-```{python}
-corr = res.drop(columns="i").select_dtypes('number').corr()
-# plot the heatmap
-sns.heatmap(corr)
-```
-
-## References
-
+## Training
 
 ```{python}
 from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer
+from sklearn.impute import SimpleImputer
+from sklearn.neighbors import LocalOutlierFactor
 
-pipe = Pipeline([('scaler', StandardScaler()),('imputer', KNNImputer(n_neighbors=25, weights="uniform")),  ('outlier', IsolationForest(random_state=0, verbose=10, n_estimators=1000, max_samples=1024*8, max_features=1.0, bootstrap=True, n_jobs=2))], verbose=True).fit(res.drop(columns=["i", "id"]))
+# ('outlier', IsolationForest(random_state=0, verbose=10, n_estimators=10000, max_samples=1024, max_features=1.0, bootstrap=True, n_jobs=4)
+# ("outlier", LocalOutlierFactor(n_jobs=4,leaf_size=30, n_neighbors=20, contamination="auto", novelty=True)
+
+pipe = Pipeline([('scaler', StandardScaler()),('imputer', SimpleImputer(strategy="mean")),  ('outlier', IsolationForest(random_state=0, verbose=10, n_estimators=10000, max_samples=512, max_features=1.0, bootstrap=False, n_jobs=4))], verbose=True)
+
+models = {}
+
+for area, area_feat in features.items():
+    areamodel = Path(filedir) / (f"control_controlarea_{area}_model.joblib")
+    if not areamodel.exists():
+        fitted = pipe.fit(area_feat.drop(columns=["i", "id"]))
+        dump(fitted, areamodel)
+    models[area] = load(areamodel)
+```
+
+## Predicting
+
+```{python}
+preds = {}
+
+def do_pred(d, i, pipe):
+    feat = calc_features(d, i)
+    preds = pipe.score_samples(feat.drop(columns=["i", "id"]))
+    return pd.DataFrame({"i":feat["i"], "id":feat["id"], "pred":preds})
+
+
+for i, (area, ix) in enumerate(tqdm(list(allfiles["test.csv"].groupby("controlArea").indices.items()), position=0, desc="Control Areas")):
+    segmentgroups = allfiles["test.csv"].iloc[ix,:].groupby("test_data_segment_id")
+    pipe = models[area]
+    res = pd.concat(tqdm(Parallel(n_jobs=4, return_as="generator")([delayed(do_pred)(d, segment, pipe) for segment, d in segmentgroups]), total=len(segmentgroups.indices.items()), position=1+i, leave=True, desc=f"Control Area {area}"), axis=0)
+    preds[area] = res
 ```
 
 ```{python}
-outliers = pd.Series(pipe.predict(res.drop(columns=["i", "id"])))
-outliers_groups = outliers.ne(outliers.shift()).cumsum()[outliers==-1]
-g = outliers_groups.rename('group').reset_index(drop=False).groupby("group").indices
+tosubmit = pd.concat(preds.values(), axis=0).rename(columns={'pred':'anomaly'}).reset_index(drop=True)
+sns.ecdfplot(x=tosubmit.anomaly)
+tosubmit["anomaly"] = (tosubmit["anomaly"]<-0.45)*1
+tosubmit.loc[:, ["id","anomaly"]].to_csv("tosubmit.csv", index=False)
+tosubmit["anomaly"].value_counts(normalize=True)
+```
+
+
+```{python}
+outliers_groups = tosubmit["anomaly"].ne(tosubmit["anomaly"].shift()).cumsum()[tosubmit["anomaly"]==1].rename('group').reset_index(drop=False)
+outliers_groups_gr = outliers_groups.groupby("group")
+outliergroup_sizes = outliers_groups_gr.size()
+outliers_groups = outliers_groups[outliers_groups["group"].isin(outliergroup_sizes.index[outliergroup_sizes > 15])]
+outliers_groups = outliers_groups.groupby("group")["index"].apply(lambda vals:list(tosubmit["id"].iloc[vals]))
 ```
 
 ```{python}
-toget = list(g.values())[90]
-dat = allfiles["train.csv"][allfiles["train.csv"]["controlArea"]==1].copy()
+i = pd.Series(list(range(outliers_groups.size))).sample(1).iloc[0]
+dat = allfiles["test.csv"]
 
-ixbad = np.where(dat.index.isin(res["id"].iloc[toget]))
-
+ixbad = np.where(dat.index.isin(outliers_groups.iloc[i]))
 start = max(np.min(ixbad) - 50,0)
 end = min(np.max(ixbad) + 50, dat.shape[0])
 tplt = dat.iloc[start:end,:]
 
 tplt = tplt.melt(id_vars=["Datum_Uhrzeit_CET", "controlArea"]) 
-toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand'}
+toshow1 = {'correctedDemand', 'aFRRactivation', 'aFRRrequest', 'BandLimitedCorrectedDemand', "LFCInput", "FRCE", "correctionEcho", "correction"}
 #toshow1 = {'correction', 'correctionEcho'}
 
 g1 = sns.relplot(
@@ -521,3 +582,7 @@ plt.axvspan(dat["Datum_Uhrzeit_CET"].iloc[np.min(ixbad)], dat["Datum_Uhrzeit_CET
 sns.move_legend(g1, "upper right")
 plt.tight_layout()
 ```
+
+
+
+## References

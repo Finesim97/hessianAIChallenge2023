@@ -8,7 +8,6 @@ Before running, make sure to setup the [Kaggle API](https://github.com/Kaggle/ka
 
 ``` sh
 mamba env create -f env.yml -n finesimhessianai23
-mamba env create -f env_tsfresh.yml -n finesimhessianai23_tsfresh
 ```
 
 ## Building
